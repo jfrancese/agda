@@ -33,6 +33,7 @@ import Data.List ((\\), isPrefixOf)
 import qualified Data.List as List
 import qualified Data.Foldable as Fold (fold, foldMap, toList)
 import qualified Data.IntMap as IntMap
+import qualified Data.Set as Set
 import qualified Data.Text.Lazy as T
 import Data.Void
 
@@ -58,6 +59,7 @@ import qualified Agda.Syntax.Common as Common
 import qualified Agda.Syntax.Concrete.Name as C
 import qualified Agda.Syntax.Concrete as C
 import Agda.Syntax.Fixity
+import Agda.Syntax.Notation
 import qualified Agda.Syntax.Info as SI
 import qualified Agda.Syntax.Internal as I
 import qualified Agda.Syntax.Literal as L
@@ -107,7 +109,7 @@ highlightAsTypeChecked rPre r m
   r'        = rToR (P.continuousPerLine r)
   delta     = rPre' `minus` r'
   clear     = mempty
-  highlight = parserBased { otherAspects = [TypeChecks] }
+  highlight = parserBased { otherAspects = Set.singleton TypeChecks }
 
   wrap rs x y = do
     p rs x
@@ -244,7 +246,10 @@ generateAndPrintSyntaxInfo decl hlLevel updateState = do
     , Fold.foldMap getPatSynArgs  $ universeBi decl
     , Fold.foldMap getModuleName  $ universeBi decl
     , Fold.foldMap getModuleInfo  $ universeBi decl
-    , Fold.foldMap getNamedArg    $ universeBi decl
+    , Fold.foldMap getNamedArgE   $ universeBi decl
+    , Fold.foldMap getNamedArgP   $ universeBi decl
+    , Fold.foldMap getNamedArgB   $ universeBi decl
+    , Fold.foldMap getNamedArgL   $ universeBi decl
     ]
     where
     bound (A.BindName n) =
@@ -295,12 +300,21 @@ generateAndPrintSyntaxInfo decl hlLevel updateState = do
     getVarAndField (A.RecUpdate _ _ fs) = mconcat [ field [] x |      (FieldAssignment x _) <- fs ]
     getVarAndField _                    = mempty
 
-    -- Ulf, 2014-04-09: It would be nicer to have it on Named_ a, but
+    -- Ulf, 2019-01-30: It would be nicer to not have to specialize it, but
     -- you can't have polymorphic functions in universeBi.
-    getNamedArg :: Common.RString -> File
-    getNamedArg x = singleton (rToR $ P.getRange x) $
-                       parserBased { aspect =
-                         Just $ Name (Just Argument) False }
+    getNamedArgE :: Common.NamedArg A.Expr -> File
+    getNamedArgE = getNamedArg
+    getNamedArgP :: Common.NamedArg A.Pattern -> File
+    getNamedArgP = getNamedArg
+    getNamedArgB :: Common.NamedArg A.BindName -> File
+    getNamedArgB = getNamedArg
+    getNamedArgL :: Common.NamedArg A.LHSCore -> File
+    getNamedArgL = getNamedArg
+
+    getNamedArg :: Common.NamedArg a -> File
+    getNamedArg x = caseMaybe (Common.nameOf $ Common.unArg x) mempty $ \ s ->
+      singleton (rToR $ P.getRange s) $
+        parserBased { aspect = Just $ Name (Just Argument) False }
 
     getLet :: A.LetBinding -> File
     getLet (A.LetBind _ _ x _ _)     = bound x
@@ -328,7 +342,7 @@ generateAndPrintSyntaxInfo decl hlLevel updateState = do
       | Just _ <- isProjP e = mempty
       | otherwise =
           singleton (rToR $ P.getRange pi)
-                (parserBased { otherAspects = [DottedPattern] })
+                (parserBased { otherAspects = Set.singleton DottedPattern })
     getPattern' (A.PatternSynP _ q _) = patsyn q
     -- Andreas, 2018-06-09, issue #3120
     -- The highlighting for record field tags is now created by the type checker in
@@ -485,7 +499,7 @@ nameKinds hlLevel decl = do
   defnToKind :: Defn -> NameKind
   defnToKind   M.Axiom{}                           = Postulate
   defnToKind   M.DataOrRecSig{}                    = Postulate
-  defnToKind   M.GeneralizableVar{}                = Bound    -- TODO: separate kind for generalizable vars
+  defnToKind   M.GeneralizableVar{}                = Generalizable
   defnToKind d@M.Function{} | isProperProjection d = Field
                             | otherwise            = Function
   defnToKind   M.Datatype{}                        = Datatype
@@ -512,7 +526,7 @@ nameKinds hlLevel decl = do
   declToKind (A.ScopedDecl {})      = id
   declToKind (A.Open {})            = id
   declToKind (A.PatternSynDef q _ _) = insert q (Constructor Common.Inductive)
-  declToKind (A.Generalize _ _ _ q _)  = insert q Postulate
+  declToKind (A.Generalize _ _ _ q _) = insert q Generalizable
   declToKind (A.FunDef  _ q _ _)     = insert q Function
   declToKind (A.UnquoteDecl _ _ qs _) = foldr (\ q f -> insert q Function . f) id qs
   declToKind (A.UnquoteDef _ qs _)    = foldr (\ q f -> insert q Function . f) id qs
@@ -587,7 +601,7 @@ errorHighlighting e = do
   -- Print new highlighting.
   s <- E.prettyError e
   let error = singleton (rToR r)
-         $ parserBased { otherAspects = [Error]
+         $ parserBased { otherAspects = Set.singleton Error
                        , note         = Just s
                        }
   return $ mconcat [ erase, error ]
@@ -613,7 +627,10 @@ warningHighlighting w = case tcWarning w of
   IllformedAsClause{}        -> deadcodeHighlighting $ P.getRange w
   UselessPublic{}            -> mempty
   UselessInline{}            -> mempty
+  WrongInstanceDeclaration{} -> mempty
   InstanceWithExplicitArg{}  -> deadcodeHighlighting $ P.getRange w
+  InstanceNoOutputTypeName{} -> mempty
+  InstanceArgWithExplicitArg{} -> mempty
   ParseWarning{}             -> mempty
   InversionDepthReached{}    -> mempty
   GenericWarning{}           -> mempty
@@ -656,7 +673,7 @@ warningHighlighting w = case tcWarning w of
 terminationErrorHighlighting :: [TerminationError] -> File
 terminationErrorHighlighting termErrs = functionDefs `mappend` callSites
   where
-    m            = parserBased { otherAspects = [TerminationProblem] }
+    m            = parserBased { otherAspects = Set.singleton TerminationProblem }
     functionDefs = Fold.foldMap (\x -> singleton (rToR $ bindingSite x) m) $
                    concatMap M.termErrFunctions termErrs
     callSites    = Fold.foldMap (\r -> singleton (rToR r) m) $
@@ -670,20 +687,20 @@ positivityErrorHighlighting :: I.QName -> OccursWhere -> File
 positivityErrorHighlighting q o = several (rToR <$> P.getRange q : rs) m
   where
     rs = case o of Unknown -> []; Known r _ -> [r]
-    m  = parserBased { otherAspects = [PositivityProblem] }
+    m  = parserBased { otherAspects = Set.singleton PositivityProblem }
 
 deadcodeHighlighting :: P.Range -> File
 deadcodeHighlighting r = singleton (rToR $ P.continuousPerLine r) m
-  where m = parserBased { otherAspects = [Deadcode] }
+  where m = parserBased { otherAspects = Set.singleton Deadcode }
 
 coverageErrorHighlighting :: P.Range -> File
 coverageErrorHighlighting r = singleton (rToR $ P.continuousPerLine r) m
-  where m = parserBased { otherAspects = [CoverageProblem] }
+  where m = parserBased { otherAspects = Set.singleton CoverageProblem }
 
 
 catchallHighlighting :: P.Range -> File
 catchallHighlighting r = singleton (rToR $ P.continuousPerLine r) m
-  where m = parserBased { otherAspects = [CatchallClause] }
+  where m = parserBased { otherAspects = Set.singleton CatchallClause }
 
 
 -- | Generates and prints syntax highlighting information for unsolved
@@ -715,7 +732,7 @@ computeUnsolvedMetaWarnings = do
 
 metasHighlighting :: [P.Range] -> File
 metasHighlighting rs = several (map (rToR . P.continuousPerLine) rs)
-                     $ parserBased { otherAspects = [UnsolvedMeta] }
+                     $ parserBased { otherAspects = Set.singleton UnsolvedMeta }
 
 -- | Generates syntax highlighting information for unsolved constraints
 --   (ideally: that are not connected to a meta variable).
@@ -726,7 +743,7 @@ computeUnsolvedConstraints = constraintsHighlighting <$> getAllConstraints
 constraintsHighlighting :: Constraints -> File
 constraintsHighlighting cs =
   several (map (rToR . P.continuousPerLine) rs)
-          (parserBased { otherAspects = [UnsolvedConstraint] })
+          (parserBased { otherAspects = Set.singleton UnsolvedConstraint })
   where
   -- get ranges of interesting unsolved constraints
   rs = (`mapMaybe` (map theConstraint cs)) $ \case
@@ -840,6 +857,7 @@ nameToFile modMap file xs x fr m mR =
   isLocal :: NameKind -> Bool
   isLocal = \case
     Bound         -> True
+    Generalizable -> True
     Argument      -> True
     Constructor{} -> False
     Datatype      -> False
@@ -850,7 +868,6 @@ nameToFile modMap file xs x fr m mR =
     Primitive     -> False
     Record        -> False
     Macro         -> False
-
 
 -- | A variant of 'nameToFile' for qualified abstract names.
 
@@ -876,6 +893,7 @@ nameToFileA modMap file x include m =
              r
              m
              (if include then Just $ bindingSite x else Nothing)
+    `mappend` notationFile
   where
     -- Andreas, 2016-09-08, for issue #2140:
     -- Range of name from fixity declaration:
@@ -883,6 +901,13 @@ nameToFileA modMap file x include m =
     -- Somehow we import fixity ranges from other files, we should ignore them.
     -- (I do not understand how we get them as they should not be serialized...)
     r = if P.rangeFile fr == Strict.Just file then fr else P.noRange
+
+    notationFile = mconcat $ map genPartFile $ theNotation $ A.nameFixity $ A.qnameName x
+    boundAspect = parserBased{ aspect = Just $ Name (Just Bound) False }
+    genPartFile (BindHole r i)   = several [rToR r, rToR $ getRange i] boundAspect
+    genPartFile (NormalHole r i) = several [rToR r, rToR $ getRange i] boundAspect
+    genPartFile WildHole{}       = mempty
+    genPartFile (IdPart x)       = singleton (rToR $ P.getRange x) (m False)
 
 concreteBase :: I.QName -> C.Name
 concreteBase = A.nameConcrete . A.qnameName

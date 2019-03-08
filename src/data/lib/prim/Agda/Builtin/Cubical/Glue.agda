@@ -69,12 +69,17 @@ A ≃ B = Σ (A → B) \ f → (isEquiv f)
 equivFun : ∀ {ℓ ℓ'} {A : Set ℓ} {B : Set ℓ'} → A ≃ B → A → B
 equivFun e = fst e
 
+-- Improved version of equivProof compared to Lemma 5 in CCHM. We put
+-- the (φ = i0) face in contr' making it be definitionally c in this
+-- case. This makes the computational behavior better, in particular
+-- for transp in Glue.
 equivProof : ∀ {la lt} (T : Set la) (A : Set lt) → (w : T ≃ A) → (a : A)
-            → ∀ ψ → (Partial ψ (fiber (w .fst) a)) → fiber (w .fst) a
+           → ∀ ψ → (Partial ψ (fiber (w .fst) a)) → fiber (w .fst) a
 equivProof A B w a ψ fb = contr' {A = fiber (w .fst) a} (w .snd .equiv-proof a) ψ fb
   where
     contr' : ∀ {ℓ} {A : Set ℓ} → isContr A → (φ : I) → (u : Partial φ A) → A
-    contr' {A = A} (c , p) φ u = hcomp (λ i o → p (u o) i) c
+    contr' {A = A} (c , p) φ u = hcomp (λ i → λ { (φ = i1) → p (u 1=1) i
+                                                ; (φ = i0) → c }) c
 
 
 {-# BUILTIN EQUIV      _≃_        #-}
@@ -87,7 +92,7 @@ primitive
       → Set ℓ'
     prim^glue   : ∀ {ℓ ℓ'} {A : Set ℓ} {φ : I}
       → {T : Partial φ (Set ℓ')} → {e : PartialP φ (λ o → T o ≃ A)}
-      → PartialP φ T → A → primGlue A T e
+      → (t : PartialP φ T) → (a : A) → primGlue A T e
     prim^unglue : ∀ {ℓ ℓ'} {A : Set ℓ} {φ : I}
       → {T : Partial φ (Set ℓ')} → {e : PartialP φ (λ o → T o ≃ A)}
       → primGlue A T e → A

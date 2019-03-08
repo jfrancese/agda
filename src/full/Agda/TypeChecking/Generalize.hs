@@ -510,9 +510,9 @@ createGenRecordType genRecMeta@(El genRecSort _) sortedMetas = do
                   { conName      = con
                   , conInductive = Inductive
                   , conFields    = genRecFields }
-  forM_ genRecFields $ \ fld -> do
-    let field   = unArg fld     -- Filled in later
-        fieldTy = El __DUMMY_SORT__ $ Pi (defaultDom __DUMMY_TYPE__) (Abs "_" __DUMMY_TYPE__)
+  forM_ (zip sortedMetas genRecFields) $ \ (meta, fld) -> do
+    fieldTy <- getMetaType meta
+    let field = unArg fld
     addConstant field $ defaultDefn (argInfo fld) field fieldTy $
       let proj = Projection { projProper   = Just genRecName
                             , projOrig     = field
@@ -532,6 +532,7 @@ createGenRecordType genRecMeta@(El genRecSort _) sortedMetas = do
                , funExtLam       = Nothing
                , funWith         = Nothing
                , funCopatternLHS = False
+               , funCovering     = []
                }
   addConstant (conName genRecCon) $ defaultDefn defaultArgInfo (conName genRecCon) __DUMMY_TYPE__ $ -- Filled in later
     Constructor { conPars   = 0

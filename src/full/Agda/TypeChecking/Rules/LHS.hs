@@ -182,6 +182,7 @@ updateProblemEqs eqs = do
 
     update :: ProblemEq -> TCM [ProblemEq]
     update eq@(ProblemEq A.WildP{} _ _) = return []
+    update eq@(ProblemEq p@A.ProjP{} _ _) = typeError $ IllformedProjectionPattern p
     update eq@(ProblemEq p v a) = reduce v >>= constructorForm >>= \case
       Con c ci es -> do
         let vs = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
@@ -535,7 +536,7 @@ transferOrigins ps qs = do
     matchingArgs p q
       -- The arguments match if
       -- 1. they are both projections,
-      | isJust (A.maybeProjP p) = isJust (isProjP q)
+      | isJust (A.isProjP p) = isJust (isProjP q)
       -- 2. or they are both visible,
       | visible p && visible q = True
       -- 3. or they have the same hiding and the argument is not named,
@@ -838,7 +839,7 @@ checkLeftHandSide c f ps a withSub' strippedPats = Bench.billToCPS [Bench.Typing
   let st = over (lhsProblem . problemEqs) (++ withEqs) st0
 
   -- doing the splits:
-  (result, block) <- inTopContext $ runWriterT $ checkLHS f st
+  (result, block) <- inTopContext $ runWriterT $ (`runReaderT` (size cxt)) $ checkLHS f st
   return result
 
 -- | Determine in which order the splits should be tried by
@@ -867,7 +868,7 @@ splitStrategy = filter shouldSplit
 
 -- | The loop (tail-recursive): split at a variable in the problem until problem is solved
 checkLHS
-  :: forall tcm a. (MonadTCM tcm, MonadReduce tcm, MonadWriter Blocked_ tcm, HasConstInfo tcm, MonadError TCErr tcm, MonadDebug tcm)
+  :: forall tcm a. (MonadTCM tcm, MonadReduce tcm, MonadWriter Blocked_ tcm, HasConstInfo tcm, MonadError TCErr tcm, MonadDebug tcm, MonadReader Nat tcm)
   => Maybe QName      -- ^ The name of the definition we are checking.
   -> LHSState a       -- ^ The current state.
   -> tcm a
@@ -965,7 +966,7 @@ checkLHS mf = updateRelevance checkLHS_ where
         ]
 
       -- @p@ should be a projection pattern projection from @target@
-      (orig, ambProjName) <- ifJust (A.maybeProjP p) return $
+      (orig, ambProjName) <- ifJust (A.isProjP p) return $
         addContext tel $ softTypeError $ CannotEliminateWithPattern p (unArg target)
 
       (projName, projType) <- suspendErrors $ do
@@ -982,7 +983,8 @@ checkLHS mf = updateRelevance checkLHS_ where
       target' <- traverse (`piApplyM` self) projType
 
       -- Compute the new state
-      let projP    = target' $> Named Nothing (ProjP orig projName)
+      let projP    = applyWhen (orig == ProjPostfix) (setHiding NotHidden) $
+                       target' $> Named Nothing (ProjP orig projName)
           ip'      = ip ++ [projP]
           -- drop the projection pattern (already splitted)
           problem' = over problemRestPats tail problem
@@ -1054,13 +1056,39 @@ checkLHS mf = updateRelevance checkLHS_ where
         LeftoverPatterns{patternVariables = vars} <- getLeftoverPatterns $ problem ^. problemEqs
         return $ take (size delta1) $ fst $ getUserVariableNames tel vars
 
+      -- Problem: The context does not match the checkpoints in checkLHS,
+      --          however we still need a proper checkpoint substitution
+      --          for checkExpr below.
+      --
+      -- Solution: partial splits are not allowed when there are
+      --           constructor patterns (checked in checkDef), so
+      --           newContext is an extension of the definition
+      --           context.
+      --
+      -- i.e.: Given
+      --
+      --             Γ = context where def is checked, also last checkpoint.
+      --
+      --       Then
+      --
+      --             newContext = Γ Ξ
+      --             cpSub = raiseS |Ξ|
+      --
+      lhsCxtSize <- ask -- size of the context before checkLHS call.
+      reportSDoc "tc.lhs.split.partial" 10 $ "lhsCxtSize =" <+> prettyTCM lhsCxtSize
+
       newContext <- liftTCM $ computeLHSContext names delta1
-      (gamma,sigma) <- liftTCM $ updateContext (raiseS (length newContext)) (newContext ++) $ do
+      reportSDoc "tc.lhs.split.partial" 10 $ "newContext =" <+> prettyTCM newContext
+
+      let cpSub = raiseS $ size newContext - lhsCxtSize
+
+      (gamma,sigma) <- liftTCM $ updateContext cpSub (const newContext) $ do
          ts <- forM ts $ \ (t,u) -> do
-                 reportSDoc "tc.lhs.split.partial" 50 $ text (show (t,u))
+                 reportSDoc "tc.lhs.split.partial" 10 $ "currentCxt =" <+> (prettyTCM =<< getContext)
+                 reportSDoc "tc.lhs.split.partial" 10 $ text "t, u (Expr) =" <+> prettyTCM (t,u)
                  t <- checkExpr t tInterval
                  u <- checkExpr u tInterval
-                 reportSDoc "tc.lhs.split.partial" 10 $ prettyTCM t <+> prettyTCM u
+                 reportSDoc "tc.lhs.split.partial" 10 $ text "t, u        =" <+> pretty (t, u)
                  u <- intervalView =<< reduce u
                  case u of
                    IZero -> primINeg <@> pure t
@@ -1079,7 +1107,10 @@ checkLHS mf = updateRelevance checkLHS_ where
                          prettyTCM a <+> " is not IsOne."
 
                    _  -> foldl (\ x y -> primIMin <@> x <@> y) primIOne (map pure ts)
+         reportSDoc "tc.lhs.split.partial" 10 $ text "phi           =" <+> prettyTCM phi
+         reportSDoc "tc.lhs.split.partial" 30 $ text "phi           =" <+> pretty phi
          phi <- reduce phi
+         reportSDoc "tc.lhs.split.partial" 10 $ text "phi (reduced) =" <+> prettyTCM phi
          refined <- forallFaceMaps phi (\ bs m t -> typeError $ GenericError $ "face blocked on meta")
                             (\ sigma -> (,sigma) <$> getContextTelescope)
          case refined of
@@ -1115,7 +1146,7 @@ checkLHS mf = updateRelevance checkLHS_ where
       -- Compute the new state
       eqs' <- liftTCM $ addContext delta' $ updateProblemEqs eqs'
       let problem' = set problemEqs eqs' problem
-      reportSDoc "tc.lhs.split.partial" 20 $ text (show problem')
+      reportSDoc "tc.lhs.split.partial" 60 $ text (show problem')
       liftTCM $ updateProblemRest (LHSState delta' ip' problem' target' (psplit ++ [Just o_n]))
 
 
@@ -1205,7 +1236,7 @@ checkLHS mf = updateRelevance checkLHS_ where
 
       -- Don't split on lazy constructor
       case focusPat of
-        A.ConP cpi _ _ | patLazy cpi -> softTypeError $
+        A.ConP cpi _ _ | patLazy cpi == ConPatLazy -> softTypeError $
           ForcedConstructorNotInstantiated focusPat
         _ -> return ()
 

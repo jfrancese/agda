@@ -105,6 +105,7 @@ import qualified Agda.Utils.Pretty as P
 import Agda.Utils.Singleton
 import Agda.Utils.Functor
 import Agda.Utils.Function
+import Agda.Utils.WithDefault ( collapseDefault )
 
 #include "undefined.h"
 import Agda.Utils.Impossible
@@ -696,10 +697,15 @@ freshName r s = do
 freshNoName :: MonadTCState m => Range -> m Name
 freshNoName r =
     do  i <- fresh
-        return $ Name i (C.NoName noRange i) r noFixity'
+        return $ Name i (C.NoName noRange i) r noFixity' False
 
 freshNoName_ :: MonadTCState m => m Name
 freshNoName_ = freshNoName noRange
+
+freshRecordName :: MonadTCState m => m Name
+freshRecordName = do
+  i <- fresh
+  return $ Name i (C.Name noRange C.NotInScope [C.Id "r"]) noRange noFixity' True
 
 -- | Create a fresh name from @a@.
 class FreshName a where
@@ -1101,7 +1107,7 @@ data CheckedTarget = CheckedTarget (Maybe ProblemId)
 
 data TypeCheckingProblem
   = CheckExpr Comparison A.Expr Type
-  | CheckArgs ExpandHidden Range [NamedArg A.Expr] Type Type (Elims -> Type -> CheckedTarget -> TCM Term)
+  | CheckArgs ExpandHidden Range [NamedArg A.Expr] Type Type ([Maybe Range] -> Elims -> Type -> CheckedTarget -> TCM Term)
   | CheckProjAppToKnownPrincipalArg Comparison A.Expr ProjOrigin (NonemptyList QName) A.Args Type Int Term Type
   | CheckLambda Comparison (Arg ([WithHiding Name], Maybe Type)) A.Expr Type
     -- ^ @(λ (xs : t₀) → e) : t@
@@ -1679,6 +1685,9 @@ data Defn = Axiom -- ^ Postulate
               --   translation to case trees.
             , funTreeless       :: Maybe Compiled
               -- ^ Intermediate representation for compiler backends.
+            , funCovering :: [Closure Clause]
+              -- ^ Covering clauses computed by coverage checking.
+              --   Erased by (IApply) confluence checking(?)
             , funInv            :: FunctionInverse
             , funMutual         :: Maybe [QName]
               -- ^ Mutually recursive functions, @data@s and @record@s.
@@ -1880,6 +1889,7 @@ emptyFunction = Function
   , funExtLam      = Nothing
   , funWith        = Nothing
   , funCopatternLHS = False
+  , funCovering    = []
   }
 
 funFlag :: FunctionFlag -> Lens' Bool Defn
@@ -2702,16 +2712,24 @@ data Warning
     -- ^ In `OldBuiltin old new`, the BUILTIN old has been replaced by new
   | EmptyRewritePragma
     -- ^ If the user wrote just @{-\# REWRITE \#-}@.
-  | IllformedAsClause
+  | IllformedAsClause String
     -- ^ If the user wrote something other than an unqualified name
     --   in the @as@ clause of an @import@ statement.
+    --   The 'String' gives optionally extra explanation.
   | UselessPublic
     -- ^ If the user opens a module public before the module header.
     --   (See issue #2377.)
   | UselessInline            QName
+  | WrongInstanceDeclaration
   | InstanceWithExplicitArg  QName
   -- ^ An instance was declared with an implicit argument, which means it
   --   will never actually be considered by instance search.
+  | InstanceNoOutputTypeName Doc
+  -- ^ The type of an instance argument doesn't end in a named or
+  -- variable type, so it will never be considered by instance search.
+  | InstanceArgWithExplicitArg Doc
+  -- ^ As InstanceWithExplicitArg, but for local bindings rather than
+  --   top-level instances.
   | InversionDepthReached    QName
   -- ^ The --inversion-max-depth was reached.
   -- Generic warnings for one-off things
@@ -2758,8 +2776,11 @@ warningName w = case w of
   CoverageNoExactSplit{}       -> CoverageNoExactSplit_
   DeprecationWarning{}         -> DeprecationWarning_
   EmptyRewritePragma           -> EmptyRewritePragma_
-  IllformedAsClause            -> IllformedAsClause_
+  IllformedAsClause{}          -> IllformedAsClause_
+  WrongInstanceDeclaration{}   -> WrongInstanceDeclaration_
   InstanceWithExplicitArg{}    -> InstanceWithExplicitArg_
+  InstanceNoOutputTypeName{}   -> InstanceNoOutputTypeName_
+  InstanceArgWithExplicitArg{} -> InstanceArgWithExplicitArg_
   GenericNonFatalError{}       -> GenericNonFatalError_
   GenericWarning{}             -> GenericWarning_
   InversionDepthReached{}      -> InversionDepthReached_
@@ -2894,6 +2915,8 @@ data SplitError
       -- ^ We do not know the target type of the clause.
   | CosplitNoRecordType (Closure Type)
       -- ^ Target type is not a record type.
+  | CannotCreateMissingClause QName (Telescope,[NamedArg DeBruijnPattern]) Doc (Closure (Abs Type))
+
   | GenericSplitError String
   deriving (Show)
 
@@ -2955,8 +2978,6 @@ data TypeError
             -- ^ Wrong user-given relevance annotation in lambda.
         | WrongQuantityInLambda
             -- ^ Wrong user-given quantity annotation in lambda.
-        | WrongInstanceDeclaration
-            -- ^ A term is declared as an instance but it’s not allowed
         | HidingMismatch Hiding Hiding
             -- ^ The given hiding does not correspond to the expected hiding.
         | RelevanceMismatch Relevance Relevance
@@ -3191,6 +3212,18 @@ instance HasOptions m => HasOptions (StateT s m) where
 instance (HasOptions m, Monoid w) => HasOptions (WriterT w m) where
   pragmaOptions      = lift pragmaOptions
   commandLineOptions = lift commandLineOptions
+
+-- Ternary options are annoying to deal with so we provide auxiliary
+-- definitions using @collapseDefault@.
+
+sizedTypesOption :: HasOptions m => m Bool
+sizedTypesOption = collapseDefault . optSizedTypes <$> pragmaOptions
+
+guardednessOption :: HasOptions m => m Bool
+guardednessOption = collapseDefault . optGuardedness <$> pragmaOptions
+
+withoutKOption :: HasOptions m => m Bool
+withoutKOption = collapseDefault . optWithoutK <$> pragmaOptions
 
 -----------------------------------------------------------------------------
 -- * The reduce monad
@@ -3817,8 +3850,8 @@ instance KillRange Defn where
       DataOrRecSig n -> DataOrRecSig n
       GeneralizableVar -> GeneralizableVar
       AbstractDefn{} -> __IMPOSSIBLE__ -- only returned by 'getConstInfo'!
-      Function cls comp tt inv mut isAbs delayed proj flags term extlam with copat ->
-        killRange13 Function cls comp tt inv mut isAbs delayed proj flags term extlam with copat
+      Function cls comp tt covering inv mut isAbs delayed proj flags term extlam with copat ->
+        killRange13 (\ cls comp tt -> Function cls comp tt covering) cls comp tt inv mut isAbs delayed proj flags term extlam with copat
       Datatype a b c d e f g h i     -> killRange8 Datatype a b c d e f g h i
       Record a b c d e f g h i j k   -> killRange11 Record a b c d e f g h i j k
       Constructor a b c d e f g h i  -> killRange9 Constructor a b c d e f g h i

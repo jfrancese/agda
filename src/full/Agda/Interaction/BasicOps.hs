@@ -52,9 +52,10 @@ import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope
 import Agda.TypeChecking.With
 import Agda.TypeChecking.Coverage
+import Agda.TypeChecking.Coverage.Match ( SplitPattern )
 import Agda.TypeChecking.Records
 import Agda.TypeChecking.Irrelevance (wakeIrrelevantVars)
-import Agda.TypeChecking.Pretty (prettyTCM)
+import Agda.TypeChecking.Pretty ( PrettyTCM, prettyTCM )
 import Agda.TypeChecking.Primitive
 import Agda.TypeChecking.Names
 import Agda.TypeChecking.Free
@@ -354,6 +355,7 @@ data OutputConstraint a b
       | SizeLtSat a
       | FindInstanceOF b a [(a,a)]
       | PTSInstance b b
+      | PostponedCheckFunDef QName a
   deriving (Functor)
 
 -- | A subset of 'OutputConstraint'.
@@ -384,6 +386,7 @@ outputFormId (OutputForm _ _ o) = out o
       SizeLtSat{}                -> __IMPOSSIBLE__
       FindInstanceOF _ _ _        -> __IMPOSSIBLE__
       PTSInstance i _            -> i
+      PostponedCheckFunDef{}     -> __IMPOSSIBLE__
 
 instance Reify ProblemConstraint (Closure (OutputForm Expr Expr)) where
   reify (PConstr pids cl) = enterClosure cl $ \c -> buildClosure =<< (OutputForm (getRange c) (Set.toList pids) <$> reify c)
@@ -455,7 +458,9 @@ instance Reify Constraint (OutputConstraint Expr Expr) where
             (,) <$> reify tm <*> reify ty)
     reify (IsEmpty r a) = IsEmptyType <$> reify a
     reify (CheckSizeLtSat a) = SizeLtSat  <$> reify a
-    reify (CheckFunDef d i q cs) = __IMPOSSIBLE__
+    reify (CheckFunDef d i q cs) = do
+      a <- reify =<< defType <$> getConstInfo q
+      return $ PostponedCheckFunDef q a
     reify (HasBiggerSort a) = OfType <$> reify a <*> reify (UnivSort a)
     reify (HasPTSRule a b) = do
       (a,(x,b)) <- reify (a,b)
@@ -468,7 +473,7 @@ instance (Pretty a, Pretty b) => Pretty (OutputForm a b) where
     where
       prange r | null s = empty
                | otherwise = text $ " [ at " ++ s ++ " ]"
-        where s = show r
+        where s = prettyShow r
 
 instance (Pretty a, Pretty b) => Pretty (OutputConstraint a b) where
   pretty oc =
@@ -495,6 +500,7 @@ instance (Pretty a, Pretty b) => Pretty (OutputConstraint a b) where
         , nest 2 $ "Candidate:"
         , nest 4 $ vcat [ pretty v .: t | (v, t) <- cs ] ]
       PTSInstance a b      -> "PTS instance for" <+> pretty (a, b)
+      PostponedCheckFunDef q a -> "Check definition of" <+> pretty q <+> ":" <+> pretty a
     where
       bin a op b = sep [a, nest 2 $ op <+> b]
       pcmp cmp a b = bin (pretty a) (pretty cmp) (pretty b)
@@ -534,6 +540,7 @@ instance (ToConcrete a c, ToConcrete b d) =>
       FindInstanceOF <$> toConcrete s <*> toConcrete t
                      <*> mapM (\(tm,ty) -> (,) <$> toConcrete tm <*> toConcrete ty) cs
     toConcrete (PTSInstance a b) = PTSInstance <$> toConcrete a <*> toConcrete b
+    toConcrete (PostponedCheckFunDef q a) = PostponedCheckFunDef q <$> toConcrete a
 
 instance (Pretty a, Pretty b) => Pretty (OutputConstraint' a b) where
   pretty (OfType' e t) = pretty e <+> ":" <+> pretty t
@@ -808,11 +815,12 @@ withMetaId m ret = do
   mv <- lookupMeta m
   withMetaInfo' mv ret
 
--- The intro tactic
-
+-- | The intro tactic.
+--
 -- Returns the terms (as strings) that can be
 -- used to refine the goal. Uses the coverage checker
 -- to find out which constructors are possible.
+--
 introTactic :: Bool -> InteractionId -> TCM [String]
 introTactic pmLambda ii = do
   mi <- lookupInteractionId ii
@@ -849,11 +857,14 @@ introTactic pmLambda ii = do
      `catchError` \_ -> return []
     _ -> __IMPOSSIBLE__
   where
+    conName :: [NamedArg SplitPattern] -> [I.ConHead]
     conName [p] = [ c | I.ConP c _ _ <- [namedArg p] ]
     conName _   = __IMPOSSIBLE__
 
-    showTCM v = show <$> prettyTCM v
+    showTCM :: PrettyTCM a => a -> TCM String
+    showTCM v = render <$> prettyTCM v
 
+    introFun :: ListTel -> TCM [String]
     introFun tel = addContext tel' $ do
         reportSDoc "interaction.intro" 10 $ do "introFun" TP.<+> prettyTCM (telFromList tel)
         imp <- showImplicitArguments
@@ -878,6 +889,7 @@ introTactic pmLambda ii = do
         makeName ("_", t) = ("x", t)
         makeName (x, t)   = (x, t)
 
+    introData :: I.Type -> TCM [String]
     introData t = do
       let tel  = telFromList [defaultDom ("_", t)]
           pat  = [defaultArg $ unnamed $ debruijnNamedVar "c" 0]
@@ -895,6 +907,10 @@ introTactic pmLambda ii = do
       let e = C.Rec noRange $ for fs $ \ f ->
             Left $ C.FieldAssignment f $ C.QuestionMark noRange Nothing
       return [ prettyShow e ]
+      -- Andreas, 2019-02-25, remark:
+      -- prettyShow is ok here since we are just printing something like
+      -- record { f1 = ? ; ... ; fn = ?}
+      -- which does not involve any qualified names, and the fi are C.Name.
 
 -- | Runs the given computation as if in an anonymous goal at the end
 --   of the top-level module.

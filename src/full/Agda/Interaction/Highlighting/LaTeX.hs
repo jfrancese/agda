@@ -449,7 +449,7 @@ processCode toks' = do
             -- to its aspect (if any) and other aspects (e.g. error, unsolved meta)
             foldr (\c t -> cmdPrefix <+> T.pack c <+> cmdArg t)
                   (escape tok)
-                  $ map fromOtherAspect (otherAspects $ info tok') ++
+                  $ map fromOtherAspect (toList $ otherAspects $ info tok') ++
                     concatMap fromAspect (toList $ aspect $ info tok')
 
     -- Non-whitespace tokens at the start of a line trigger an
@@ -488,6 +488,7 @@ processCode toks' = do
         (\c -> if isOp then ["Operator", c] else [c]) $
         case kind of
           Bound                     -> s
+          Generalizable             -> s
           Constructor Inductive     -> "InductiveConstructor"
           Constructor CoInductive   -> "CoinductiveConstructor"
           Datatype                  -> s
